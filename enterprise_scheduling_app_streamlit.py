@@ -1,65 +1,140 @@
 # app.py
-# Enterprise-grade Scheduling App with Recurring Events (Streamlit Cloud Ready)
+# Enterprise Scheduling Platform – AWS & Postgres Ready
 
+import os
 import streamlit as st
 import pandas as pd
 from datetime import datetime, date, time, timedelta
 import uuid
-
-st.set_page_config(
-    page_title="Enterprise Scheduler",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+import bcrypt
+from sqlalchemy import create_engine, text
 
 # --------------------
-# Styling – Corporate Polish
+# Configuration
 # --------------------
 
-st.markdown(
-    """
-    <style>
-    html, body, [class*="css"]  {
-        font-family: 'Inter', 'Segoe UI', sans-serif;
-    }
-    .block-container {
-        padding-top: 2rem;
-        padding-bottom: 2rem;
-    }
-    .metric-container {
-        background-color: #f7f9fc;
-        border-radius: 12px;
-        padding: 1rem;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True
-)
+st.set_page_config(page_title="Enterprise Scheduler", layout="wide")
+
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    st.error("DATABASE_URL environment variable not set")
+    st.stop()
+
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
 # --------------------
-# Utilities
+# Database Init
 # --------------------
 
-def generate_id():
-    return str(uuid.uuid4())
+with engine.begin() as conn:
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS users (
+            id UUID PRIMARY KEY,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL
+        );
+    """))
 
-if "events" not in st.session_state:
-    st.session_state.events = pd.DataFrame(columns=[
-        "id", "series_id", "title", "owner", "start", "end",
-        "priority", "status", "recurrence", "notes"
-    ])
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS events (
+            id UUID PRIMARY KEY,
+            series_id UUID,
+            title TEXT,
+            owner TEXT,
+            start_ts TIMESTAMP,
+            end_ts TIMESTAMP,
+            priority TEXT,
+            status TEXT,
+            recurrence TEXT,
+            notes TEXT
+        );
+    """))
+
+# --------------------
+# Auth Utilities
+# --------------------
+
+def hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+
+
+def verify_password(password: str, hashed: str) -> bool:
+    return bcrypt.checkpw(password.encode(), hashed.encode())
+
+# --------------------
+# Session Init
+# --------------------
+
+if "user" not in st.session_state:
+    st.session_state.user = None
+
+# --------------------
+# Authentication
+# --------------------
+
+if st.session_state.user is None:
+    st.title("Secure Enterprise Login")
+
+    tab1, tab2 = st.tabs(["Login", "Register"])
+
+    with tab1:
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        if st.button("Login"):
+            with engine.connect() as conn:
+                row = conn.execute(text(
+                    "SELECT id, username, role, password_hash FROM users WHERE username=:u"
+                ), {"u": username}).fetchone()
+
+            if row and verify_password(password, row.password_hash):
+                st.session_state.user = {
+                    "id": row.id,
+                    "username": row.username,
+                    "role": row.role
+                }
+                st.success("Login successful")
+                st.experimental_rerun()
+            else:
+                st.error("Invalid credentials")
+
+    with tab2:
+        new_user = st.text_input("New Username")
+        new_pass = st.text_input("New Password", type="password")
+        role = st.selectbox("Role", ["User", "Admin"])
+        if st.button("Register"):
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text(
+                        "INSERT INTO users VALUES (:id,:u,:p,:r)"
+                    ), {
+                        "id": str(uuid.uuid4()),
+                        "u": new_user,
+                        "p": hash_password(new_pass),
+                        "r": role
+                    })
+                st.success("User registered")
+            except Exception:
+                st.error("Username already exists")
+
+    st.stop()
 
 # --------------------
 # Sidebar
 # --------------------
 
 st.sidebar.title("Enterprise Scheduler")
-st.sidebar.caption("Operational Scheduling Platform")
+st.sidebar.caption(f"User: {st.session_state.user['username']} ({st.session_state.user['role']})")
+
+if st.sidebar.button("Logout"):
+    st.session_state.user = None
+    st.experimental_rerun()
+
 view = st.sidebar.radio("Navigation", [
     "Create Event",
-    "Event List",
-    "Calendar View",
-    "Admin Dashboard"
+    "My Events",
+    "Calendar",
+    "Admin Dashboard" if st.session_state.user["role"] == "Admin" else ""
 ])
 
 # --------------------
@@ -67,161 +142,129 @@ view = st.sidebar.radio("Navigation", [
 # --------------------
 
 if view == "Create Event":
-    st.title("Create Schedule")
-    st.caption("Define one-time or recurring operational events")
+    st.header("Create Event or Recurring Series")
 
-    with st.form("create_event_form"):
-        title = st.text_input("Event Title")
-        owner = st.text_input("Owner / Team")
-
+    with st.form("event_form"):
+        title = st.text_input("Title")
         col1, col2 = st.columns(2)
         with col1:
-            start_date = st.date_input("Start Date", date.today())
-            start_time = st.time_input("Start Time", time(9, 0))
+            sd = st.date_input("Start Date", date.today())
+            stt = st.time_input("Start Time", time(9, 0))
         with col2:
-            end_date = st.date_input("End Date", date.today())
-            end_time = st.time_input("End Time", time(10, 0))
+            ed = st.date_input("End Date", date.today())
+            ett = st.time_input("End Time", time(10, 0))
 
         priority = st.selectbox("Priority", ["Low", "Medium", "High", "Critical"])
-        status = st.selectbox("Status", ["Planned", "Confirmed"])
-
-        recurrence = st.selectbox(
-            "Recurrence",
-            ["None", "Daily", "Weekly", "Monthly"]
-        )
-
-        occurrences = st.number_input(
-            "Number of Occurrences",
-            min_value=1,
-            max_value=365,
-            value=1,
-            disabled=(recurrence == "None")
-        )
-
+        recurrence = st.selectbox("Recurrence", ["None", "Daily", "Weekly", "Monthly"])
+        count = st.number_input("Occurrences", 1, 365, 1, disabled=(recurrence == "None"))
         notes = st.text_area("Notes")
 
-        submitted = st.form_submit_button("Create Schedule")
+        submit = st.form_submit_button("Create")
 
-        if submitted:
-            start_dt = datetime.combine(start_date, start_time)
-            end_dt = datetime.combine(end_date, end_time)
-            series_id = generate_id()
+        if submit:
+            start_dt = datetime.combine(sd, stt)
+            end_dt = datetime.combine(ed, ett)
+            series_id = uuid.uuid4()
 
             rows = []
-            for i in range(occurrences):
+            for i in range(count):
                 if recurrence == "Daily":
                     delta = timedelta(days=i)
                 elif recurrence == "Weekly":
                     delta = timedelta(weeks=i)
                 elif recurrence == "Monthly":
-                    delta = timedelta(days=30 * i)
+                    delta = timedelta(days=30*i)
                 else:
-                    delta = timedelta(days=0)
+                    delta = timedelta()
 
                 rows.append({
-                    "id": generate_id(),
+                    "id": uuid.uuid4(),
                     "series_id": series_id,
                     "title": title,
-                    "owner": owner,
-                    "start": start_dt + delta,
-                    "end": end_dt + delta,
+                    "owner": st.session_state.user['username'],
+                    "start_ts": start_dt + delta,
+                    "end_ts": end_dt + delta,
                     "priority": priority,
-                    "status": status,
+                    "status": "Planned",
                     "recurrence": recurrence,
                     "notes": notes
                 })
 
-            st.session_state.events = pd.concat(
-                [st.session_state.events, pd.DataFrame(rows)],
-                ignore_index=True
-            )
+            with engine.begin() as conn:
+                for r in rows:
+                    conn.execute(text("""
+                        INSERT INTO events VALUES
+                        (:id,:sid,:t,:o,:s,:e,:p,:st,:r,:n)
+                    """), {
+                        "id": r['id'], "sid": r['series_id'], "t": r['title'], "o": r['owner'],
+                        "s": r['start_ts'], "e": r['end_ts'], "p": r['priority'],
+                        "st": r['status'], "r": r['recurrence'], "n": r['notes']
+                    })
 
-            st.success(f"{len(rows)} event(s) scheduled successfully")
-
-# --------------------
-# Event List
-# --------------------
-
-elif view == "Event List":
-    st.title("Scheduled Events")
-    st.caption("Enterprise-wide event registry")
-
-    if st.session_state.events.empty:
-        st.info("No events scheduled")
-    else:
-        df = st.session_state.events.sort_values("start")
-
-        filters = st.columns(4)
-        owner_filter = filters[0].selectbox("Owner", ["All"] + sorted(df.owner.unique().tolist()))
-        priority_filter = filters[1].selectbox("Priority", ["All"] + sorted(df.priority.unique().tolist()))
-        status_filter = filters[2].selectbox("Status", ["All"] + sorted(df.status.unique().tolist()))
-        recurrence_filter = filters[3].selectbox("Recurrence", ["All"] + sorted(df.recurrence.unique().tolist()))
-
-        if owner_filter != "All":
-            df = df[df.owner == owner_filter]
-        if priority_filter != "All":
-            df = df[df.priority == priority_filter]
-        if status_filter != "All":
-            df = df[df.status == status_filter]
-        if recurrence_filter != "All":
-            df = df[df.recurrence == recurrence_filter]
-
-        st.dataframe(df, use_container_width=True, height=420)
+            st.success(f"{len(rows)} event(s) created")
 
 # --------------------
-# Calendar View
+# My Events
 # --------------------
 
-elif view == "Calendar View":
-    st.title("Daily Calendar")
-    st.caption("Operational visibility by date")
+elif view == "My Events":
+    st.header("My Scheduled Events")
+    with engine.connect() as conn:
+        df = pd.read_sql(text(
+            "SELECT * FROM events WHERE owner=:o ORDER BY start_ts"
+        ), conn, params={"o": st.session_state.user['username']})
 
-    if st.session_state.events.empty:
-        st.info("No events to display")
-    else:
-        df = st.session_state.events.copy()
-        df["date"] = df.start.dt.date
+    st.dataframe(df, use_container_width=True)
 
-        selected_date = st.date_input("Select Date", date.today())
-        daily = df[df.date == selected_date]
+# --------------------
+# Calendar (Full Calendar View)
 
-        if daily.empty:
-            st.info("No scheduled events")
-        else:
-            for _, row in daily.iterrows():
-                with st.container():
-                    st.markdown(
-                        f"""
-                        <div style="border-left: 6px solid #3b82f6; padding: 1rem; margin-bottom: 1rem; background-color: #f8fafc; border-radius: 8px;">
-                        <strong>{row['title']}</strong><br>
-                        {row['start'].strftime('%H:%M')} – {row['end'].strftime('%H:%M')}<br>
-                        Owner: {row['owner']}<br>
-                        Priority: {row['priority']} | Recurrence: {row['recurrence']}
-                        </div>
-                        """,
-                        unsafe_allow_html=True
-                    )
+from streamlit_calendar import calendar
+
+calendar_options = {
+    "initialView": "dayGridMonth",
+    "headerToolbar": {
+        "left": "prev,next today",
+        "center": "title",
+        "right": "dayGridMonth,timeGridWeek,timeGridDay"
+    },
+    "height": 650,
+}
+
+# --------------------
+
+elif view == "Calendar":
+    st.header("Enterprise Calendar")
+    st.caption("Interactive scheduling calendar")
+
+    with engine.connect() as conn:
+        df = pd.read_sql("SELECT * FROM events", conn)
+
+    calendar_events = []
+    for _, r in df.iterrows():
+        calendar_events.append({
+            "title": f"{r['title']} ({r['priority']})",
+            "start": r['start_ts'].isoformat(),
+            "end": r['end_ts'].isoformat(),
+        })
+
+    calendar(calendar_events, options=calendar_options)
 
 # --------------------
 # Admin Dashboard
 # --------------------
 
-elif view == "Admin Dashboard":
-    st.title("Admin Dashboard")
-    st.caption("Governance, metrics, and export")
+elif view == "Admin Dashboard" and st.session_state.user['role'] == "Admin":
+    st.header("Admin Dashboard")
 
-    if st.session_state.events.empty:
-        st.info("No data available")
-    else:
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Total Events", len(st.session_state.events))
-        col2.metric("Recurring Series", st.session_state.events.series_id.nunique())
-        col3.metric("Critical Priority", len(st.session_state.events[st.session_state.events.priority == "Critical"]))
+    with engine.connect() as conn:
+        total = conn.execute(text("SELECT COUNT(*) FROM events")).scalar()
+        users = conn.execute(text("SELECT COUNT(*) FROM users")).scalar()
 
-        csv = st.session_state.events.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download Schedule (CSV)",
-            data=csv,
-            file_name="enterprise_schedule.csv",
-            mime="text/csv"
-        )
+    c1, c2 = st.columns(2)
+    c1.metric("Total Events", total)
+    c2.metric("Total Users", users)
+
+    with engine.connect() as conn:
+        df = pd.read_sql("SELECT * FROM events", conn)
+    st.dataframe(df, use_container_width=True)
